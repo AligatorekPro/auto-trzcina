@@ -7,7 +7,6 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.screen.GenericContainerScreenHandler;
-import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
@@ -36,7 +35,13 @@ public final class FarmBot {
     private static long navStart, lastMove;
     private static Vec3d lastPos = Vec3d.ZERO;
     private static int retries, failCount;
-    private static final Deque<int[]> actions = new ArrayDeque<>();
+
+    // sprzedaz: sloty do kliknięcia w kolejnych oknach + shift-klik na trzcinie
+    private static final Deque<Integer> openSlots = new ArrayDeque<>();
+    private static boolean waitingWindow = false;
+    private static int syncAtClick = -1;
+    private static long waitStart;
+    private static int shiftTries;
 
     private FarmBot() {
     }
@@ -190,32 +195,74 @@ public final class FarmBot {
                 go(Phase.SELL_WAIT_GUI, now);
             }
             case SELL_WAIT_GUI -> {
-                if (mc.currentScreen instanceof GenericContainerScreen gcs) {
-                    buildActions(gcs, c);
-                    nextActionAt = now + 500;
+                if (mc.currentScreen instanceof GenericContainerScreen) {
+                    openSlots.clear();
+                    for (String s : c.sellSlots.split("[,;\\s]+")) {
+                        if (s.isBlank()) continue;
+                        try {
+                            openSlots.add(Integer.parseInt(s.trim()));
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                    shiftTries = 0;
+                    waitingWindow = false;
+                    nextActionAt = now + 600;
                     go(Phase.SELL_ACTIONS, now);
                 } else if (now - phaseStart > 6000) {
                     fail(mc, "Sklep sie nie otworzyl (sprawdz komende)", now);
                 }
             }
             case SELL_ACTIONS -> {
-                if (!(mc.currentScreen instanceof GenericContainerScreen)) {
+                if (!(mc.currentScreen instanceof GenericContainerScreen gcs)) {
+                    if (waitingWindow && now - waitStart < 4000) return;
                     finishSell(mc, now);
                     return;
                 }
+                GenericContainerScreenHandler h = gcs.getScreenHandler();
+
+                // czekamy az po kliknieciu otworzy sie nowe okno
+                if (waitingWindow) {
+                    if (h.syncId != syncAtClick) {
+                        waitingWindow = false;
+                        nextActionAt = now + 700;
+                    } else if (now - waitStart > 4000) {
+                        waitingWindow = false;
+                    } else {
+                        return;
+                    }
+                }
                 if (now < nextActionAt) return;
-                int[] a = actions.pollFirst();
-                if (a == null) {
-                    go(Phase.SELL_CLOSE, now);
+
+                // 1) kliknij kolejny slot z listy (np. "Sprzedaz przedmiotow")
+                Integer slot = openSlots.pollFirst();
+                if (slot != null) {
+                    if (slot >= 0 && slot < h.slots.size()) {
+                        mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.PICKUP, p);
+                        syncAtClick = h.syncId;
+                        waitingWindow = true;
+                        waitStart = now;
+                    }
+                    nextActionAt = now + c.clickDelayMs;
+                    status = "Klikam w sklepie";
                     return;
                 }
-                ScreenHandler h = p.currentScreenHandler;
-                if (a[0] >= 0 && a[0] < h.slots.size()) {
-                    mc.interactionManager.clickSlot(h.syncId, a[0], 0,
-                            a[1] == 1 ? SlotActionType.QUICK_MOVE : SlotActionType.PICKUP, p);
+
+                // 2) shift + lewy klik na ikonie trzciny (powtarza, az trzcina zniknie z ekwipunku)
+                if (shiftTries < 6 && countCane(p) > 0) {
+                    int idx = findCaneSlot(h);
+                    if (idx < 0) {
+                        fail(mc, "Nie widze ikony trzciny w oknie sklepu", now);
+                        return;
+                    }
+                    mc.interactionManager.clickSlot(h.syncId, idx, 0,
+                            c.depositMode ? SlotActionType.QUICK_MOVE : SlotActionType.PICKUP, p);
+                    shiftTries++;
+                    nextActionAt = now + Math.max(c.clickDelayMs, 800);
+                    status = "Sprzedaje trzcine";
+                    return;
                 }
-                nextActionAt = now + c.clickDelayMs;
-                status = "Sprzedaje...";
+
+                go(Phase.SELL_CLOSE, now);
             }
             case SELL_CLOSE -> {
                 if (now - phaseStart > 800) finishSell(mc, now);
@@ -235,12 +282,14 @@ public final class FarmBot {
         }
         cycles++;
         failCount = 0;
+        waitingWindow = false;
         status = "Sprzedano (cykl " + cycles + ")";
         go(Phase.WAIT_NEXT, now);
     }
 
     private static void fail(MinecraftClient mc, String msg, long now) {
         failCount++;
+        waitingWindow = false;
         chat(mc, "#cancel");
         if (mc.player != null && mc.currentScreen instanceof GenericContainerScreen) {
             mc.player.closeHandledScreen();
@@ -311,35 +360,13 @@ public final class FarmBot {
         return n;
     }
 
-    private static void buildActions(GenericContainerScreen gcs, AutoConfig c) {
-        actions.clear();
-        GenericContainerScreenHandler h = gcs.getScreenHandler();
-        int container = h.getRows() * 9;
-
-        if (c.depositMode) {
-            for (int i = container; i < h.slots.size(); i++) {
-                if (h.slots.get(i).getStack().isOf(Items.SUGAR_CANE)) actions.add(new int[]{i, 1});
-            }
+    /** Szuka ikony trzciny w gornej czesci okna (sklepu), nie w Twoim ekwipunku. */
+    private static int findCaneSlot(GenericContainerScreenHandler h) {
+        int container = Math.min(h.getRows() * 9, h.slots.size());
+        for (int i = 0; i < container; i++) {
+            if (h.slots.get(i).getStack().isOf(Items.SUGAR_CANE)) return i;
         }
-
-        boolean any = false;
-        for (String s : c.sellSlots.split("[,;\\s]+")) {
-            if (s.isBlank()) continue;
-            try {
-                actions.add(new int[]{Integer.parseInt(s.trim()), 0});
-                any = true;
-            } catch (NumberFormatException ignored) {
-            }
-        }
-
-        if (!any && !c.depositMode) {
-            for (int i = 0; i < container && i < h.slots.size(); i++) {
-                if (h.slots.get(i).getStack().isOf(Items.SUGAR_CANE)) {
-                    actions.add(new int[]{i, 0});
-                    break;
-                }
-            }
-        }
+        return -1;
     }
 
     private static void chat(MinecraftClient mc, String msg) {
