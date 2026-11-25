@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "autotrzcina",
+  "version": "${version}",
+  "name": "AutoTrzcina",
+  "description": "Automat farmy trzciny: klika przycisk, chodzi do ustawionych miejsc i sprzedaje trzcine. Wymaga moda Baritone.",
+  "authors": ["Alek"],
+  "environment": "client",
+  "entrypoints": {
+    "client": ["pl.autotrzcina.AutoTrzcinaMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "baritone": "*"
+  }
+}
