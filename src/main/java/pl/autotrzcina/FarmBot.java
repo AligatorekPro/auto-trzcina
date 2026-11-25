@@ -21,22 +21,21 @@ import java.util.Deque;
 
 public final class FarmBot {
     private enum Phase {
-        WAIT_NEXT, GO_BUTTON, AIM, PRESS, GO_COLLECT, COLLECT_WAIT,
-        GO_SELL, SELL_OPEN, SELL_WAIT_GUI, SELL_ACTIONS, SELL_CLOSE
+        GO_BUTTON, AIM, PRESS, GO_COLLECT, STAND,
+        SELL_OPEN, SELL_WAIT_GUI, SELL_ACTIONS, SELL_CLOSE
     }
 
     private static boolean running = false;
-    private static Phase phase = Phase.WAIT_NEXT;
+    private static Phase phase = Phase.STAND;
     public static volatile String status = "Wylaczony";
     public static int cycles = 0;
 
-    private static long phaseStart, nextPressAt, nextActionAt;
+    private static long phaseStart, nextPressAt, nextSellAt, nextActionAt;
     private static BlockPos navTarget;
     private static long navStart, lastMove;
     private static Vec3d lastPos = Vec3d.ZERO;
     private static int retries, failCount;
 
-    // sprzedaz: sloty do kliknięcia w kolejnych oknach + shift-klik na trzcinie
     private static final Deque<Integer> openSlots = new ArrayDeque<>();
     private static boolean waitingWindow = false;
     private static int syncAtClick = -1;
@@ -77,10 +76,12 @@ public final class FarmBot {
             return;
         }
         running = true;
-        phase = Phase.WAIT_NEXT;
+        phase = Phase.GO_BUTTON;
         nextPressAt = 0;
+        nextSellAt = 0;
         navTarget = null;
         failCount = 0;
+        waitingWindow = false;
         status = "Start";
         chat(mc, "#set allowBreak false");
         chat(mc, "#set allowPlace false");
@@ -120,14 +121,6 @@ public final class FarmBot {
         long now = System.currentTimeMillis();
 
         switch (phase) {
-            case WAIT_NEXT -> {
-                long left = nextPressAt - now;
-                if (left <= 0) {
-                    go(Phase.GO_BUTTON, now);
-                } else {
-                    status = "Czekam na kolejny cykl: " + fmt(left / 1000);
-                }
-            }
             case GO_BUTTON -> {
                 status = "Ide do przycisku";
                 if (navigateTo(mc, c.buttonStand.toBlockPos(), now)) go(Phase.AIM, now);
@@ -161,27 +154,30 @@ public final class FarmBot {
                 go(Phase.GO_COLLECT, now);
             }
             case GO_COLLECT -> {
-                status = "Ide zbierac trzcine";
-                if (navigateTo(mc, c.collect.toBlockPos(), now)) go(Phase.COLLECT_WAIT, now);
+                status = "Ide na farme";
+                if (navigateTo(mc, c.collect.toBlockPos(), now)) go(Phase.STAND, now);
             }
-            case COLLECT_WAIT -> {
-                long left = phaseStart + c.collectSec * 1000L - now;
-                if (left <= 0) {
-                    boolean sameSpot = c.sell == null
-                            || (c.sell.x == c.collect.x && c.sell.y == c.collect.y && c.sell.z == c.collect.z);
-                    go(sameSpot ? Phase.SELL_OPEN : Phase.GO_SELL, now);
-                } else {
-                    status = "Zbieram trzcine: " + fmt(left / 1000);
+            case STAND -> {
+                long untilPress = nextPressAt - now;
+                if (untilPress <= 0) {
+                    go(Phase.GO_BUTTON, now);
+                    return;
                 }
-            }
-            case GO_SELL -> {
-                status = "Ide sprzedawac";
-                if (navigateTo(mc, c.sell.toBlockPos(), now)) go(Phase.SELL_OPEN, now);
+                BlockPos col = c.collect.toBlockPos();
+                if (p.squaredDistanceTo(col.getX() + 0.5, col.getY(), col.getZ() + 0.5) > 9.0) {
+                    go(Phase.GO_COLLECT, now);
+                    return;
+                }
+                int cane = countCane(p);
+                if (cane > 0 && now >= nextSellAt && mc.currentScreen == null) {
+                    go(Phase.SELL_OPEN, now);
+                    return;
+                }
+                status = "Na farmie | trzcina: " + cane + " | przycisk za " + fmt(untilPress / 1000);
             }
             case SELL_OPEN -> {
                 if (countCane(p) == 0) {
-                    status = "Brak trzciny do sprzedania";
-                    go(Phase.WAIT_NEXT, now);
+                    go(Phase.STAND, now);
                     return;
                 }
                 String cmd = c.sellCommand == null ? "" : c.sellCommand.trim();
@@ -220,7 +216,6 @@ public final class FarmBot {
                 }
                 GenericContainerScreenHandler h = gcs.getScreenHandler();
 
-                // czekamy az po kliknieciu otworzy sie nowe okno
                 if (waitingWindow) {
                     if (h.syncId != syncAtClick) {
                         waitingWindow = false;
@@ -233,7 +228,7 @@ public final class FarmBot {
                 }
                 if (now < nextActionAt) return;
 
-                // 1) kliknij kolejny slot z listy (np. "Sprzedaz przedmiotow")
+                // 1) kolejne sloty z listy (kompas, czerwona welna...)
                 Integer slot = openSlots.pollFirst();
                 if (slot != null) {
                     if (slot >= 0 && slot < h.slots.size()) {
@@ -247,15 +242,14 @@ public final class FarmBot {
                     return;
                 }
 
-                // 2) shift + lewy klik na ikonie trzciny (powtarza, az trzcina zniknie z ekwipunku)
+                // 2) lewy shift + PRAWY przycisk myszy na ikonie trzciny
                 if (shiftTries < 6 && countCane(p) > 0) {
-                    int idx = findCaneSlot(h);
-                    if (idx < 0) {
+                    int caneSlot = findCaneSlot(h);
+                    if (caneSlot < 0) {
                         fail(mc, "Nie widze ikony trzciny w oknie sklepu", now);
                         return;
                     }
-                    mc.interactionManager.clickSlot(h.syncId, idx, 0,
-                            c.depositMode ? SlotActionType.QUICK_MOVE : SlotActionType.PICKUP, p);
+                    mc.interactionManager.clickSlot(h.syncId, caneSlot, 1, SlotActionType.QUICK_MOVE, p);
                     shiftTries++;
                     nextActionAt = now + Math.max(c.clickDelayMs, 800);
                     status = "Sprzedaje trzcine";
@@ -283,8 +277,9 @@ public final class FarmBot {
         cycles++;
         failCount = 0;
         waitingWindow = false;
-        status = "Sprzedano (cykl " + cycles + ")";
-        go(Phase.WAIT_NEXT, now);
+        nextSellAt = now + AutoConfig.get().collectSec * 1000L;
+        status = "Sprzedano (" + cycles + ")";
+        go(Phase.STAND, now);
     }
 
     private static void fail(MinecraftClient mc, String msg, long now) {
@@ -300,8 +295,9 @@ public final class FarmBot {
             return;
         }
         status = msg;
+        nextSellAt = now + 30_000;
         nextPressAt = Math.max(nextPressAt, now + 30_000);
-        go(Phase.WAIT_NEXT, now);
+        go(Phase.STAND, now);
     }
 
     private static boolean navigateTo(MinecraftClient mc, BlockPos target, long now) {
@@ -360,7 +356,6 @@ public final class FarmBot {
         return n;
     }
 
-    /** Szuka ikony trzciny w gornej czesci okna (sklepu), nie w Twoim ekwipunku. */
     private static int findCaneSlot(GenericContainerScreenHandler h) {
         int container = Math.min(h.getRows() * 9, h.slots.size());
         for (int i = 0; i < container; i++) {
