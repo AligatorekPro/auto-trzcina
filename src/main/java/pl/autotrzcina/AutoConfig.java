@@ -44,7 +44,7 @@ public class AutoConfig {
     // sklep
     public String sellCommand = "/sklep";
     public String sellSlots = "";
-    public boolean depositMode = false;
+    public boolean depositMode = true;
     public boolean showSlotNumbers = false;
 
     // inne
