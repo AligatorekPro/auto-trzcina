@@ -31,18 +31,18 @@ public class AutoScreen extends Screen {
     private int px, py;
     private String info = "";
     private long infoUntil = 0;
+    private boolean resetArmed = false;
 
     public AutoScreen(Screen parent) {
         super(Text.literal("AutoTrzcina"));
         this.parent = parent;
     }
 
-    // ---------- layout ----------
-
     @Override
     protected void init() {
         px = (width - PW) / 2;
         py = (height - PH) / 2;
+        resetArmed = false;
 
         int tw = (PW - 20) / TABS.length;
         for (int i = 0; i < TABS.length; i++) {
@@ -89,23 +89,41 @@ public class AutoScreen extends Screen {
                     else FarmBot.start(mc);
                     clearAndInit();
                 }).dimensions(px + 10, rowY(0), PW - 20, 22).build());
+
         toggle(colX(0), rowY(1) + 2, colW(), "Pasek statusu", () -> c.hud, v -> c.hud = v);
+        toggle(colX(1), rowY(1) + 2, colW(), "Raport na czacie", () -> c.chatReport, v -> c.chatReport = v);
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Wyzeruj statystyki"), b -> {
+            if (!resetArmed) {
+                resetArmed = true;
+                b.setMessage(Text.literal("Na pewno? Kliknij jeszcze raz").styled(s -> s.withColor(0xFF5555)));
+            } else {
+                resetArmed = false;
+                FarmBot.resetStats();
+                b.setMessage(Text.literal("Wyzerowano!"));
+                showInfo("Statystyki wyzerowane");
+            }
+        }).dimensions(px + 10, rowY(2) + 4, PW - 20, 20).build());
     }
 
     private void tabPositions() {
         posRow(0, "Stoję przy przycisku", () -> c.buttonStand, v -> c.buttonStand = v, false);
         posRow(1, "Przycisk (patrz na niego)", () -> c.button, v -> c.button = v, true);
         posRow(2, "Miejsce zbierania", () -> c.collect, v -> c.collect = v, false);
-        posRow(3, "Miejsce sprzedaży", () -> c.sell, v -> c.sell = v, false);
+        posRow(3, "Miejsce sprzedaży (nieużywane)", () -> c.sell, v -> c.sell = v, false);
     }
 
     private void tabTimes() {
         addDrawableChild(new IntSlider(px + 10, rowY(0), PW - 20, "Klikanie przycisku co", 30, 3600, 30,
                 c.intervalSec, AutoScreen::secs, v -> c.intervalSec = v));
-        addDrawableChild(new IntSlider(px + 10, rowY(1), PW - 20, "Zbieranie trzciny", 5, 300, 5,
+        addDrawableChild(new IntSlider(px + 10, rowY(1), PW - 20, "Min. przerwa między sprzedażami", 5, 300, 5,
                 c.collectSec, AutoScreen::secs, v -> c.collectSec = v));
         addDrawableChild(new IntSlider(px + 10, rowY(2), PW - 20, "Opóźnienie kliknięć w sklepie", 200, 2000, 100,
                 c.clickDelayMs, v -> v + " ms", v -> c.clickDelayMs = v));
+
+        toggle(colX(0), rowY(3), colW(), "Auto-skok", () -> c.autoJump, v -> c.autoJump = v);
+        addDrawableChild(new IntSlider(colX(1), rowY(3), colW(), "Skok co", 1, 30, 1,
+                c.jumpMinutes, v -> v + " min", v -> c.jumpMinutes = v));
     }
 
     private void tabShop() {
@@ -117,13 +135,19 @@ public class AutoScreen extends Screen {
 
         TextFieldWidget slots = new TextFieldWidget(textRenderer, px + 130, rowY(1), PW - 140, 20, Text.literal("Sloty"));
         slots.setMaxLength(60);
-        slots.setPlaceholder(Text.literal("np. 13, 22 (puste = auto)"));
+        slots.setPlaceholder(Text.literal("np. 13, 20 (kompas, wełna)"));
         slots.setText(c.sellSlots);
         slots.setChangedListener(s -> c.sellSlots = s);
         addDrawableChild(slots);
 
-        toggle(px + 10, rowY(2), PW - 20, "Wrzucaj trzcinę (shift-klik)", () -> c.depositMode, v -> c.depositMode = v);
+        toggle(px + 10, rowY(2), PW - 20, "Debug: wiadomości sklepu na czacie", () -> c.debugShop, v -> c.debugShop = v);
         toggle(px + 10, rowY(3), PW - 20, "Pokaż numery slotów w sklepie", () -> c.showSlotNumbers, v -> c.showSlotNumbers = v);
+
+        TextFieldWidget rx = new TextFieldWidget(textRenderer, px + 130, rowY(4), PW - 140, 20, Text.literal("Regex"));
+        rx.setMaxLength(300);
+        rx.setText(c.moneyRegex);
+        rx.setChangedListener(s -> c.moneyRegex = s);
+        addDrawableChild(rx);
     }
 
     private void tabLook() {
@@ -281,16 +305,22 @@ public class AutoScreen extends Screen {
 
         int gray = 0xFFBBBBBB;
         if (tab == 0) {
-            int y = rowY(2) + 8;
-            ctx.drawTextWithShadow(textRenderer, Text.literal("Cykle: " + FarmBot.cycles), px + 12, y, gray);
+            int y = rowY(2) + 34;
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("Zebrano łącznie: " + FarmBot.money(c.totalCollected) + " trzciny"),
+                    px + 12, y, gray);
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("Sprzedano: " + FarmBot.money(c.totalSold) + "  |  Zarobiono: " + FarmBot.money(c.totalMoney)),
+                    px + 12, y + 11, gray);
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("Zarobek na godzinę: " + (run ? FarmBot.money(FarmBot.perHour()) : "-")),
+                    px + 12, y + 22, gray);
             String next = run ? "Następne kliknięcie za: " + FarmBot.fmt(FarmBot.secondsToNext()) : "Bot wyłączony";
-            ctx.drawTextWithShadow(textRenderer, Text.literal(next), px + 12, y + 12, gray);
+            ctx.drawTextWithShadow(textRenderer, Text.literal(next), px + 12, y + 33, gray);
             boolean bar = FarmBot.baritoneLoaded();
             ctx.drawTextWithShadow(textRenderer,
-                    Text.literal("Baritone: " + (bar ? "wykryty" : "BRAK - zainstaluj")), px + 12, y + 24,
-                    bar ? 0xFF55FF55 : 0xFFFF5555);
-            ctx.drawTextWithShadow(textRenderer, Text.literal("Klawisze: O = menu, G = start/stop"),
-                    px + 12, y + 40, 0xFF888888);
+                    Text.literal("Baritone: " + (bar ? "wykryty" : "BRAK - zainstaluj") + "   (O = menu, G = start/stop)"),
+                    px + 12, y + 44, bar ? 0xFF55FF55 : 0xFFFF5555);
         } else if (tab == 1) {
             ctx.drawTextWithShadow(textRenderer, Text.literal("Stań w miejscu, otwórz menu (O) i kliknij."),
                     px + 12, rowY(4) + 2, 0xFF888888);
@@ -299,8 +329,9 @@ public class AutoScreen extends Screen {
         } else if (tab == 3) {
             ctx.drawTextWithShadow(textRenderer, Text.literal("Komenda sklepu"), px + 12, rowY(0) + 6, gray);
             ctx.drawTextWithShadow(textRenderer, Text.literal("Sloty do kliknięcia"), px + 12, rowY(1) + 6, gray);
-            ctx.drawTextWithShadow(textRenderer, Text.literal("Numery slotów włącz i wejdź do /sklep."),
-                    px + 12, rowY(4) + 2, 0xFF888888);
+            ctx.drawTextWithShadow(textRenderer, Text.literal("Wzór kwoty (regex)"), px + 12, rowY(4) + 6, gray);
+            ctx.drawTextWithShadow(textRenderer, Text.literal("Kolejność slotów: kompas, potem czerwona wełna."),
+                    px + 12, rowY(5) + 4, 0xFF888888);
         }
 
         if (!info.isEmpty() && System.currentTimeMillis() < infoUntil) {

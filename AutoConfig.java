@@ -31,21 +31,33 @@ public class AutoConfig {
     }
 
     // pozycje
-    public Pos buttonStand;   // gdzie stoje przy przycisku
-    public Pos button;        // blok przycisku
-    public Pos collect;       // gdzie zbieram trzcine
-    public Pos sell;          // gdzie sprzedaje (opcjonalne)
+    public Pos buttonStand;
+    public Pos button;
+    public Pos collect;
+    public Pos sell;
 
     // czasy
     public int intervalSec = 600;
-    public int collectSec = 60;
+    public int collectSec = 60;      // min. przerwa miedzy sprzedazami
     public int clickDelayMs = 500;
 
     // sklep
     public String sellCommand = "/sklep";
     public String sellSlots = "";
-    public boolean depositMode = false;
+    public boolean depositMode = false; // juz nieuzywane
     public boolean showSlotNumbers = false;
+
+    // statystyki i raport
+    public boolean chatReport = true;
+    public boolean debugShop = false;
+    public String moneyRegex = "(?i)sprzeda.*?\\bza\\s*\\$?\\s*([0-9][0-9.,\\s]*)|sprzeda.*?([0-9][0-9.,\\s]*)\\s*(?:\\$|zł)";
+    public long totalCollected = 0;
+    public long totalSold = 0;
+    public double totalMoney = 0;
+
+    // auto-skok
+    public boolean autoJump = false;
+    public int jumpMinutes = 5;
 
     // inne
     public boolean hud = true;
@@ -74,6 +86,7 @@ public class AutoConfig {
         }
         if (INSTANCE.sellCommand == null) INSTANCE.sellCommand = "/sklep";
         if (INSTANCE.sellSlots == null) INSTANCE.sellSlots = "";
+        if (INSTANCE.moneyRegex == null) INSTANCE.moneyRegex = new AutoConfig().moneyRegex;
         save();
     }
 
