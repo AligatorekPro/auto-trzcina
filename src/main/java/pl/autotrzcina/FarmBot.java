@@ -2,8 +2,11 @@ package pl.autotrzcina;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.screen.GenericContainerScreenHandler;
@@ -17,13 +20,23 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class FarmBot {
     private enum Phase {
         GO_BUTTON, AIM, PRESS, GO_COLLECT, STAND,
-        SELL_OPEN, SELL_WAIT_GUI, SELL_ACTIONS, SELL_CLOSE
+        SELL_OPEN, SELL_WAIT_GUI, SELL_ACTIONS, SELL_CLOSE,
+        DEAD_WAIT, HOME_OPEN, HOME_WAIT_GUI, HOME_ACTIONS, HOME_TP_WAIT
     }
+
+    private static final long QUIET_MS = 60_000;     // tyle bez nowej trzciny = "zebrano cala"
+    private static final long HOME_TP_MS = 10_000;   // czekanie na teleport po /home
 
     private static boolean running = false;
     private static Phase phase = Phase.STAND;
@@ -36,11 +49,36 @@ public final class FarmBot {
     private static Vec3d lastPos = Vec3d.ZERO;
     private static int retries, failCount;
 
+    // okna (sklep / home): klikanie slotow po kolei
     private static final Deque<Integer> openSlots = new ArrayDeque<>();
     private static boolean waitingWindow = false;
     private static int syncAtClick = -1;
     private static long waitStart;
     private static int shiftTries;
+
+    // statystyki / raport
+    private static int lastCane = 0, caneAtOpen = 0, collectedWhileReport = 0;
+    private static long moneyWindowUntil = 0, reportAt = 0, sessionStart = 0, lastPickupAt = 0;
+    private static boolean reportPending = false, moneyFound = false;
+    private static double pendingMoney = 0, sessionMoney = 0;
+
+    // szacowany zarobek (na podstawie cykli: klikniecie przycisku -> zebranie i sprzedaz trzciny)
+    private static long cycleStart = 0;
+    private static double cycleMoney = 0, cycMoneySum = 0;
+    private static long cycDurSum = 0;
+    private static int cycSamples = 0;
+
+    // anty-AFK
+    private static long nextJumpAt = 0, jumpReleaseAt = 0, nextHeadAt = 0;
+
+    // jedzenie
+    private static boolean eating = false;
+    private static long eatStart = 0, nextEatCheck = 0, noFoodWarnAt = 0;
+    private static int eatPrevSlot = -1;
+
+    // smierc / home
+    private static long deadAt = 0, lastRespawnTry = 0, homeReadyAt = 0;
+    private static int homeTries = 0;
 
     private FarmBot() {
     }
@@ -51,6 +89,53 @@ public final class FarmBot {
 
     public static long secondsToNext() {
         return Math.max(0, (nextPressAt - System.currentTimeMillis()) / 1000);
+    }
+
+    public static double perHour() {
+        long ms = System.currentTimeMillis() - sessionStart;
+        if (!running || ms < 60_000) return 0;
+        return sessionMoney * 3_600_000.0 / ms;
+    }
+
+    /** Zarobek z jednego cyklu; -1 gdy jeszcze nie wiadomo. */
+    public static double estimateCycleMoney() {
+        if (cycSamples > 0) return cycMoneySum / cycSamples;
+        long now = System.currentTimeMillis();
+        if (cycleStart != 0 && cycleMoney > 0 && lastCane == 0 && now - lastPickupAt > QUIET_MS) {
+            return cycleMoney;
+        }
+        return -1;
+    }
+
+    /** Szacowany zarobek za ustawiona liczbe godzin AFK; -1 gdy jeszcze nie wiadomo. */
+    public static double estimateAfk() {
+        double cm = estimateCycleMoney();
+        if (cm < 0) return -1;
+        AutoConfig c = AutoConfig.get();
+        double cycSec = cycSamples > 0 ? (cycDurSum / 1000.0 / cycSamples) : c.intervalSec;
+        if (cycSec < 1) cycSec = 1;
+        return cm * (c.afkHours * 3600.0 / cycSec);
+    }
+
+    public static void resetStats() {
+        AutoConfig c = AutoConfig.get();
+        c.totalCollected = 0;
+        c.totalSold = 0;
+        c.totalMoney = 0;
+        c.deaths = 0;
+        sessionMoney = 0;
+        sessionStart = System.currentTimeMillis();
+        cycles = 0;
+        resetCycleStats();
+        AutoConfig.save();
+    }
+
+    private static void resetCycleStats() {
+        cycleStart = 0;
+        cycleMoney = 0;
+        cycMoneySum = 0;
+        cycDurSum = 0;
+        cycSamples = 0;
     }
 
     public static boolean baritoneLoaded() {
@@ -75,10 +160,23 @@ public final class FarmBot {
             say(mc, "Najpierw ustaw pozycje w menu (O).");
             return;
         }
+        long now = System.currentTimeMillis();
         running = true;
         phase = Phase.GO_BUTTON;
+        phaseStart = now;
         nextPressAt = 0;
         nextSellAt = 0;
+        nextJumpAt = now + c.jumpMinutes * 60_000L;
+        nextHeadAt = 0;
+        nextEatCheck = 0;
+        eating = false;
+        eatPrevSlot = -1;
+        sessionStart = now;
+        sessionMoney = 0;
+        lastCane = countCane(mc.player);
+        lastPickupAt = now;
+        reportPending = false;
+        resetCycleStats();
         navTarget = null;
         failCount = 0;
         waitingWindow = false;
@@ -95,6 +193,8 @@ public final class FarmBot {
             if (mc.player != null && mc.currentScreen instanceof GenericContainerScreen) {
                 mc.player.closeHandledScreen();
             }
+            releaseKeys(mc);
+            AutoConfig.save();
         }
         running = false;
         status = reason;
@@ -103,22 +203,79 @@ public final class FarmBot {
     public static void onDisconnect() {
         running = false;
         status = "Rozlaczono";
+        AutoConfig.save();
+    }
+
+    /** Wiadomosci z serwera - szukamy kwoty za sprzedaz (tylko w oknie sprzedazy). */
+    public static void onMessage(Text msg) {
+        if (!running) return;
+        long now = System.currentTimeMillis();
+        if (now > moneyWindowUntil) return;
+        AutoConfig c = AutoConfig.get();
+        MinecraftClient mc = MinecraftClient.getInstance();
+        String s = msg.getString();
+        if (c.debugShop && mc.player != null) {
+            mc.player.sendMessage(Text.literal("[Debug] " + s), false);
+        }
+        if (c.moneyRegex == null || c.moneyRegex.isBlank()) return;
+        try {
+            Matcher m = Pattern.compile(c.moneyRegex).matcher(s);
+            if (m.find()) {
+                for (int g = 1; g <= m.groupCount(); g++) {
+                    String grp = m.group(g);
+                    if (grp != null) {
+                        double v = parseAmount(grp);
+                        if (v > 0) {
+                            pendingMoney += v;
+                            moneyFound = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     public static void tick(MinecraftClient mc) {
         if (!running) return;
-        ClientPlayerEntity p = mc.player;
-        if (p == null || mc.world == null) {
+        if (mc.getNetworkHandler() == null) {
             running = false;
             status = "Rozlaczono";
             return;
         }
-        if (p.isDead() || p.getHealth() <= 0) {
-            stop(mc, "Zginales - zatrzymano");
-            return;
-        }
+        ClientPlayerEntity p = mc.player;
+        if (p == null || mc.world == null) return; // np. ladowanie po respawnie
+
         AutoConfig c = AutoConfig.get();
         long now = System.currentTimeMillis();
+        boolean dead = p.isDead() || p.getHealth() <= 0 || mc.currentScreen instanceof DeathScreen;
+
+        // swiezy zgon
+        if (dead && phase != Phase.DEAD_WAIT) {
+            onDeath(mc, c, now);
+            if (!running) return;
+        }
+
+        // puszczenie klawisza skoku
+        if (jumpReleaseAt != 0 && now >= jumpReleaseAt) {
+            mc.options.jumpKey.setPressed(false);
+            jumpReleaseAt = 0;
+        }
+
+        // statystyki: ile trzciny przybylo w ekwipunku
+        int caneNow = countCane(p);
+        if (caneNow > lastCane && mc.currentScreen == null) {
+            int diff = caneNow - lastCane;
+            c.totalCollected += diff;
+            lastPickupAt = now;
+            if (reportPending) collectedWhileReport += diff;
+        }
+        lastCane = caneNow;
+
+        if (reportPending && now >= reportAt) sendReport(mc, c);
+
+        if (!dead) handleEating(mc, p, c, now);
 
         switch (phase) {
             case GO_BUTTON -> {
@@ -148,6 +305,16 @@ public final class FarmBot {
                 BlockHitResult hit = new BlockHitResult(center, face, b, false);
                 mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
                 p.swingHand(Hand.MAIN_HAND);
+
+                // poprzedni cykl zakonczony -> do sredniej
+                if (cycleStart != 0 && cycleMoney > 0) {
+                    cycSamples++;
+                    cycMoneySum += cycleMoney;
+                    cycDurSum += now - cycleStart;
+                }
+                cycleStart = now;
+                cycleMoney = 0;
+
                 nextPressAt = now + c.intervalSec * 1000L;
                 failCount = 0;
                 status = "Kliknieto przycisk";
@@ -168,15 +335,41 @@ public final class FarmBot {
                     go(Phase.GO_COLLECT, now);
                     return;
                 }
-                int cane = countCane(p);
-                if (cane > 0 && now >= nextSellAt && mc.currentScreen == null) {
+
+                // auto-skok (anty-AFK)
+                if (c.autoJump) {
+                    long cap = now + c.jumpMinutes * 60_000L;
+                    if (nextJumpAt > cap) nextJumpAt = cap;
+                    if (now >= nextJumpAt && p.isOnGround() && mc.currentScreen == null && !eating) {
+                        mc.options.jumpKey.setPressed(true);
+                        jumpReleaseAt = now + 150;
+                        nextJumpAt = now + c.jumpMinutes * 60_000L;
+                    }
+                }
+
+                // losowe male obroty glowy (anty-AFK)
+                if (c.headTurn) {
+                    ThreadLocalRandom r = ThreadLocalRandom.current();
+                    if (nextHeadAt == 0) nextHeadAt = now + r.nextLong(25_000, 70_000);
+                    if (now >= nextHeadAt && mc.currentScreen == null && !eating) {
+                        p.setYaw(p.getYaw() + (float) r.nextDouble(-18, 18));
+                        p.setPitch(MathHelper.clamp(p.getPitch() + (float) r.nextDouble(-6, 6), -35.0F, 45.0F));
+                        nextHeadAt = now + r.nextLong(25_000, 70_000);
+                    }
+                }
+
+                // sprzedaz: od ustawionej ilosci, a reszte gdy trzcina przestala spadac
+                int minSell = Math.max(1, c.minSell);
+                boolean quiet = now - lastPickupAt > QUIET_MS;
+                if (lastCane > 0 && (lastCane >= minSell || quiet)
+                        && now >= nextSellAt && mc.currentScreen == null && !eating) {
                     go(Phase.SELL_OPEN, now);
                     return;
                 }
-                status = "Na farmie | trzcina: " + cane + " | przycisk za " + fmt(untilPress / 1000);
+                status = "Na farmie | trzcina: " + lastCane + " | przycisk za " + fmt(untilPress / 1000);
             }
             case SELL_OPEN -> {
-                if (countCane(p) == 0) {
+                if (lastCane == 0) {
                     go(Phase.STAND, now);
                     return;
                 }
@@ -186,20 +379,18 @@ public final class FarmBot {
                     fail(mc, "Brak komendy sklepu w menu", now);
                     return;
                 }
+                caneAtOpen = lastCane;
+                pendingMoney = 0;
+                moneyFound = false;
+                reportPending = false;
+                moneyWindowUntil = now + 90_000;
                 p.networkHandler.sendChatCommand(cmd);
                 status = "Otwieram sklep";
                 go(Phase.SELL_WAIT_GUI, now);
             }
             case SELL_WAIT_GUI -> {
                 if (mc.currentScreen instanceof GenericContainerScreen) {
-                    openSlots.clear();
-                    for (String s : c.sellSlots.split("[,;\\s]+")) {
-                        if (s.isBlank()) continue;
-                        try {
-                            openSlots.add(Integer.parseInt(s.trim()));
-                        } catch (NumberFormatException ignored) {
-                        }
-                    }
+                    fillSlots(c.sellSlots);
                     shiftTries = 0;
                     waitingWindow = false;
                     nextActionAt = now + 600;
@@ -261,7 +452,309 @@ public final class FarmBot {
             case SELL_CLOSE -> {
                 if (now - phaseStart > 800) finishSell(mc, now);
             }
+
+            // ----- smierc -> /home -> wznowienie farmy -----
+            case DEAD_WAIT -> {
+                long left = deadAt + c.homeDelaySec * 1000L - now;
+                if (left > 0) {
+                    status = "Zginąłeś - /home za " + fmt(left / 1000);
+                    return;
+                }
+                if (dead) {
+                    if (now - lastRespawnTry > 1500) {
+                        p.requestRespawn();
+                        lastRespawnTry = now;
+                    }
+                    status = "Respawn...";
+                    return;
+                }
+                if (homeReadyAt == 0) homeReadyAt = now + 2500;
+                if (now < homeReadyAt) {
+                    status = "Ładowanie świata...";
+                    return;
+                }
+                homeReadyAt = 0;
+                homeTries = 0;
+                go(Phase.HOME_OPEN, now);
+            }
+            case HOME_OPEN -> {
+                if (homeTries > 0 && now - phaseStart < 5000) {
+                    status = "Ponawiam /home...";
+                    return;
+                }
+                String cmd = c.homeCommand == null ? "" : c.homeCommand.trim();
+                if (cmd.startsWith("/")) cmd = cmd.substring(1);
+                if (cmd.isEmpty()) {
+                    stop(mc, "Brak komendy /home w menu");
+                    return;
+                }
+                p.networkHandler.sendChatCommand(cmd);
+                status = "Wpisuję /home";
+                go(Phase.HOME_WAIT_GUI, now);
+            }
+            case HOME_WAIT_GUI -> {
+                boolean hasSlots = !parseSlots(c.homeSlots).isEmpty();
+                if (mc.currentScreen instanceof GenericContainerScreen) {
+                    fillSlots(c.homeSlots);
+                    waitingWindow = false;
+                    nextActionAt = now + 600;
+                    go(Phase.HOME_ACTIONS, now);
+                } else if (!hasSlots && now - phaseStart > 3000) {
+                    go(Phase.HOME_TP_WAIT, now);
+                } else if (now - phaseStart > 8000) {
+                    homeFail(mc, "Okno /home sie nie otworzylo", now);
+                }
+            }
+            case HOME_ACTIONS -> {
+                if (!(mc.currentScreen instanceof GenericContainerScreen gcs)) {
+                    if (waitingWindow && now - waitStart < 4000) return;
+                    go(Phase.HOME_TP_WAIT, now);
+                    return;
+                }
+                GenericContainerScreenHandler h = gcs.getScreenHandler();
+
+                if (waitingWindow) {
+                    if (h.syncId != syncAtClick) {
+                        waitingWindow = false;
+                        nextActionAt = now + 700;
+                    } else if (now - waitStart > 4000) {
+                        waitingWindow = false;
+                    } else {
+                        return;
+                    }
+                }
+                if (now < nextActionAt) return;
+
+                Integer slot = openSlots.pollFirst();
+                if (slot != null) {
+                    if (slot >= 0 && slot < h.slots.size()) {
+                        mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.PICKUP, p);
+                        syncAtClick = h.syncId;
+                        waitingWindow = true;
+                        waitStart = now;
+                    }
+                    nextActionAt = now + c.clickDelayMs;
+                    status = "Klikam w oknie /home";
+                    return;
+                }
+                p.closeHandledScreen();
+                go(Phase.HOME_TP_WAIT, now);
+            }
+            case HOME_TP_WAIT -> {
+                if (mc.currentScreen instanceof GenericContainerScreen) {
+                    p.closeHandledScreen();
+                }
+                long left = phaseStart + HOME_TP_MS - now;
+                if (left > 0) {
+                    status = "Teleport na home... " + fmt(left / 1000);
+                    return;
+                }
+                nextPressAt = 0;
+                nextSellAt = 0;
+                failCount = 0;
+                lastCane = countCane(p);
+                lastPickupAt = now;
+                say(mc, "Wróciłem na home - wznawiam farmę.");
+                go(Phase.GO_BUTTON, now);
+            }
         }
+    }
+
+    // ---------- smierc ----------
+
+    private static void onDeath(MinecraftClient mc, AutoConfig c, long now) {
+        c.deaths++;
+        AutoConfig.save();
+        chat(mc, "#cancel");
+        releaseKeys(mc);
+        waitingWindow = false;
+        reportPending = false;
+        moneyWindowUntil = 0;
+        navTarget = null;
+        cycleStart = 0;
+        cycleMoney = 0;
+        if (!c.autoHome) {
+            stop(mc, "Zginales - zatrzymano");
+            return;
+        }
+        deadAt = now;
+        homeReadyAt = 0;
+        homeTries = 0;
+        lastRespawnTry = 0;
+        go(Phase.DEAD_WAIT, now);
+    }
+
+    private static void homeFail(MinecraftClient mc, String msg, long now) {
+        homeTries++;
+        waitingWindow = false;
+        if (mc.player != null && mc.currentScreen instanceof GenericContainerScreen) {
+            mc.player.closeHandledScreen();
+        }
+        say(mc, msg);
+        if (homeTries >= 3) {
+            stop(mc, "Zatrzymano: " + msg);
+            return;
+        }
+        go(Phase.HOME_OPEN, now);
+    }
+
+    // ---------- jedzenie ----------
+
+    private static boolean isGoodFood(ItemStack s) {
+        if (s == null || s.isEmpty() || !s.contains(DataComponentTypes.FOOD)) return false;
+        return !(s.isOf(Items.ROTTEN_FLESH) || s.isOf(Items.SPIDER_EYE) || s.isOf(Items.POISONOUS_POTATO)
+                || s.isOf(Items.PUFFERFISH) || s.isOf(Items.CHICKEN) || s.isOf(Items.CHORUS_FRUIT)
+                || s.isOf(Items.GOLDEN_APPLE) || s.isOf(Items.ENCHANTED_GOLDEN_APPLE)
+                || s.isOf(Items.SUSPICIOUS_STEW));
+    }
+
+    private static void handleEating(MinecraftClient mc, ClientPlayerEntity p, AutoConfig c, long now) {
+        if (eating) {
+            boolean abort = phase != Phase.STAND || mc.currentScreen != null;
+            if (abort || now - eatStart > 5000 || (now - eatStart > 400 && !p.isUsingItem())) {
+                mc.options.useKey.setPressed(false);
+                eating = false;
+                if (eatPrevSlot >= 0) {
+                    p.getInventory().selectedSlot = eatPrevSlot;
+                    eatPrevSlot = -1;
+                }
+                nextEatCheck = now + 3000;
+            }
+            return;
+        }
+        if (!c.autoEat || phase != Phase.STAND || mc.currentScreen != null) return;
+        if (now < nextEatCheck) return;
+        nextEatCheck = now + 1000;
+
+        if (p.getHungerManager().getFoodLevel() >= c.eatBelow) return;
+
+        int slot = -1;
+        for (int i = 0; i < 9; i++) {
+            if (isGoodFood(p.getInventory().main.get(i))) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            // jedzenie w glownym ekwipunku -> zamien z aktualnie wybranym slotem paska
+            for (int i = 9; i < 36; i++) {
+                if (isGoodFood(p.getInventory().main.get(i))) {
+                    int sel = p.getInventory().selectedSlot;
+                    mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, sel, SlotActionType.SWAP, p);
+                    slot = sel;
+                    break;
+                }
+            }
+        }
+        if (slot < 0) {
+            if (now >= noFoodWarnAt) {
+                say(mc, "Jestem głodny, ale nie mam jedzenia!");
+                noFoodWarnAt = now + 60_000;
+            }
+            return;
+        }
+        eatPrevSlot = p.getInventory().selectedSlot;
+        p.getInventory().selectedSlot = slot;
+        mc.options.useKey.setPressed(true);
+        eating = true;
+        eatStart = now;
+        status = "Jem";
+    }
+
+    private static void releaseKeys(MinecraftClient mc) {
+        if (jumpReleaseAt != 0) {
+            mc.options.jumpKey.setPressed(false);
+            jumpReleaseAt = 0;
+        }
+        if (eating) {
+            mc.options.useKey.setPressed(false);
+            eating = false;
+            eatPrevSlot = -1;
+        }
+    }
+
+    // ---------- raport ----------
+
+    private static void sendReport(MinecraftClient mc, AutoConfig c) {
+        reportPending = false;
+        int sold = Math.max(0, caneAtOpen - lastCane + collectedWhileReport);
+        collectedWhileReport = 0;
+        if (sold <= 0 && !moneyFound) return;
+
+        c.totalSold += sold;
+        c.totalMoney += pendingMoney;
+        sessionMoney += pendingMoney;
+        if (moneyFound) cycleMoney += pendingMoney;
+        AutoConfig.save();
+
+        if (!c.chatReport || mc.player == null) return;
+        String msg = "[AutoTrzcina] Sprzedano " + money(sold) + " trzciny";
+        if (moneyFound) {
+            msg += ", zarobiłeś " + money(pendingMoney);
+        } else {
+            msg += " (nie wykryłem kwoty - włącz Debug w menu, zakładka Sklep)";
+        }
+        msg += ". Razem: " + money(c.totalSold) + " trzciny, " + money(c.totalMoney) + " zarobione.";
+        mc.player.sendMessage(Text.literal(msg), false);
+    }
+
+    public static String money(double v) {
+        if (Math.abs(v - Math.rint(v)) < 0.005) {
+            return String.format(Locale.ROOT, "%,d", (long) Math.rint(v)).replace(',', ' ');
+        }
+        return String.format(Locale.ROOT, "%,.2f", v).replace(',', ' ');
+    }
+
+    private static double parseAmount(String raw) {
+        String s = raw.replace('\u00A0', ' ').replaceAll("\\s+", "").replaceAll("[^0-9.,]", "");
+        while (!s.isEmpty() && (s.endsWith(".") || s.endsWith(","))) {
+            s = s.substring(0, s.length() - 1);
+        }
+        if (s.isEmpty()) return 0;
+        int lastDot = s.lastIndexOf('.');
+        int lastComma = s.lastIndexOf(',');
+        try {
+            if (lastDot >= 0 && lastComma >= 0) {
+                char dec = lastDot > lastComma ? '.' : ',';
+                char th = dec == '.' ? ',' : '.';
+                s = s.replace(String.valueOf(th), "").replace(dec, '.');
+            } else if (lastDot >= 0 || lastComma >= 0) {
+                char sep = lastDot >= 0 ? '.' : ',';
+                int count = 0;
+                for (int i = 0; i < s.length(); i++) {
+                    if (s.charAt(i) == sep) count++;
+                }
+                int after = s.length() - s.lastIndexOf(sep) - 1;
+                if (count > 1 || after == 3) {
+                    s = s.replace(String.valueOf(sep), "");
+                } else {
+                    s = s.replace(sep, '.');
+                }
+            }
+            return Double.parseDouble(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    // ---------- pomocnicze ----------
+
+    private static List<Integer> parseSlots(String text) {
+        List<Integer> out = new ArrayList<>();
+        if (text == null) return out;
+        for (String s : text.split("[,;\\s]+")) {
+            if (s.isBlank()) continue;
+            try {
+                out.add(Integer.parseInt(s.trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return out;
+    }
+
+    private static void fillSlots(String text) {
+        openSlots.clear();
+        openSlots.addAll(parseSlots(text));
     }
 
     private static void go(Phase next, long now) {
@@ -277,6 +770,10 @@ public final class FarmBot {
         cycles++;
         failCount = 0;
         waitingWindow = false;
+        collectedWhileReport = 0;
+        reportPending = true;
+        reportAt = now + 2500;
+        moneyWindowUntil = now + 2500;
         nextSellAt = now + AutoConfig.get().collectSec * 1000L;
         status = "Sprzedano (" + cycles + ")";
         go(Phase.STAND, now);
@@ -285,6 +782,8 @@ public final class FarmBot {
     private static void fail(MinecraftClient mc, String msg, long now) {
         failCount++;
         waitingWindow = false;
+        reportPending = false;
+        moneyWindowUntil = 0;
         chat(mc, "#cancel");
         if (mc.player != null && mc.currentScreen instanceof GenericContainerScreen) {
             mc.player.closeHandledScreen();

@@ -38,14 +38,40 @@ public class AutoConfig {
 
     // czasy
     public int intervalSec = 600;
-    public int collectSec = 60;
+    public int collectSec = 60;      // min. przerwa miedzy sprzedazami
     public int clickDelayMs = 500;
+    public int minSell = 0;          // 0 = od 1 sztuki
+    public int afkHours = 8;         // do szacowanego zarobku
 
     // sklep
     public String sellCommand = "/sklep";
     public String sellSlots = "";
-    public boolean depositMode = true;
+    public boolean depositMode = false; // juz nieuzywane
     public boolean showSlotNumbers = false;
+
+    // statystyki i raport
+    public boolean chatReport = true;
+    public boolean debugShop = false;
+    public String moneyRegex = "(?i)sprzeda.*?\\bza\\s*\\$?\\s*([0-9][0-9.,\\s]*)|sprzeda.*?([0-9][0-9.,\\s]*)\\s*(?:\\$|zł)";
+    public long totalCollected = 0;
+    public long totalSold = 0;
+    public double totalMoney = 0;
+    public int deaths = 0;
+
+    // anty-AFK
+    public boolean autoJump = false;
+    public int jumpMinutes = 5;
+    public boolean headTurn = false;
+
+    // auto-jedzenie
+    public boolean autoEat = false;
+    public int eatBelow = 14;        // je, gdy glod < tej wartosci (max 20)
+
+    // smierc -> /home
+    public boolean autoHome = true;
+    public String homeCommand = "/home";
+    public String homeSlots = "";
+    public int homeDelaySec = 30;
 
     // inne
     public boolean hud = true;
@@ -74,6 +100,9 @@ public class AutoConfig {
         }
         if (INSTANCE.sellCommand == null) INSTANCE.sellCommand = "/sklep";
         if (INSTANCE.sellSlots == null) INSTANCE.sellSlots = "";
+        if (INSTANCE.homeCommand == null) INSTANCE.homeCommand = "/home";
+        if (INSTANCE.homeSlots == null) INSTANCE.homeSlots = "";
+        if (INSTANCE.moneyRegex == null) INSTANCE.moneyRegex = new AutoConfig().moneyRegex;
         save();
     }
 
